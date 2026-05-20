@@ -1,0 +1,28 @@
+{
+  "name": "awche-lottery-telegram-bot",
+  "version": "1.0.0",
+  "description": "Awche Lottery Telegram Bot — CBE receipt OCR, Airtable validation, lottery registration",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js",
+    "info": "node index.js"
+  },
+  "keywords": [
+    "telegram",
+    "bot",
+    "lottery",
+    "airtable",
+    "ocr",
+    "awche"
+  ],
+  "author": "titiyon19-lab",
+  "license": "MIT",
+  "engines": {
+    "node": ">=18"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/titiyon19-lab/telegram-bot.git"
+  },
+  "note": "The bot runtime is Python (main.py). This package.json documents the project and the web frontend."
+}
