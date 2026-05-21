@@ -1,95 +1,141 @@
 """
-Telegram Lottery Bot
---------------------
-Photo path:  /start → send receipt photo → OCR extracts ID + Name → ask mobile → save all → success
-Manual path: /start → type Transaction ID → ask Full Name → ask Mobile → save all → success
+Telegram Lottery Bot — Awche Lottery  (Production / Railway)
+-------------------------------------------------------------
+Flow:
+  /start → instant welcome (first name) + ask Transaction ID
+  text   → exact Airtable FT lookup  → ask Full Name + City
+  text   → store name+city           → ask Mobile number
+  text   → Airtable save             → success + lottery number
 
-Required environment variables:
-    TELEGRAM_BOT_TOKEN   - Token from @BotFather
-    AIRTABLE_API_KEY     - Airtable personal access token
-    AIRTABLE_BASE_ID     - Defaults to "appa4GoH54MAPKcUT"
-    AIRTABLE_TABLE_NAME  - Defaults to "tblqr6cf0PQA5Zwel"
+Architecture:
+  • Telegram polling loop — never blocked, sub-ms handler returns
+  • _TEXT_POOL  (6 workers) — fast Airtable lookups (FT ID queries)
+  • _SAVE_POOL  (4 workers) — Airtable registration writes
+  • Health HTTP server on $PORT — Railway health-check compatible
+  • SIGTERM handler — graceful shutdown
+  • Polling reconnect loop — auto-restarts after transient failures
 
-Dependencies:
-    pip install pyTelegramBotAPI==4.23.0 pyairtable==3.0.1 pytesseract Pillow
-    System: tesseract
+Target latency:
+  /start     < 200 ms  (pure in-handler, no I/O)
+  FT lookup  < 2 s     (Airtable query in _TEXT_POOL thread)
+
+Required env vars:
+  TELEGRAM_BOT_TOKEN   BotFather token
+  AIRTABLE_API_KEY     Personal access token
+  AIRTABLE_BASE_ID     (default: appa4GoH54MAPKcUT)
+  AIRTABLE_TABLE_NAME  (default: tblqr6cf0PQA5Zwel)
+  PORT                 HTTP health-check port (Railway injects this)
 """
 
+from __future__ import annotations
+
 import html
-import io
 import logging
 import os
 import re
-import socket
+import signal
+import sys
 import threading
+import time
 import traceback
+from concurrent.futures import ThreadPoolExecutor
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from typing import Optional
 
-import pytesseract
 import telebot
-from PIL import Image, ImageFilter
 from pyairtable import Api
 from pyairtable.formulas import match
 
-# ---------------------------------------------------------------------------
-# Setup
-# ---------------------------------------------------------------------------
+# ─────────────────────────────────────────────────────────────────────────────
+# Structured logging
+# ─────────────────────────────────────────────────────────────────────────────
 
 logging.basicConfig(
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    stream=sys.stdout,
     level=logging.INFO,
+    format="%(asctime)s.%(msecs)03d [%(levelname)s] %(message)s",
+    datefmt="%Y-%m-%dT%H:%M:%S",
 )
-logger = logging.getLogger(__name__)
+log = logging.getLogger("awche_bot")
 
-_raw_token = os.environ.get("TELEGRAM_BOT_TOKEN", "")
-TELEGRAM_BOT_TOKEN = _raw_token.strip()
+# ─────────────────────────────────────────────────────────────────────────────
+# Environment & token validation  (fail fast)
+# ─────────────────────────────────────────────────────────────────────────────
 
-# Validate token format: must be "<digits>:<alphanum>" with no spaces
-if not TELEGRAM_BOT_TOKEN:
-    raise ValueError("[TOKEN] TELEGRAM_BOT_TOKEN secret is empty — please set it in Replit Secrets.")
-if " " in TELEGRAM_BOT_TOKEN or "\n" in TELEGRAM_BOT_TOKEN:
-    raise ValueError(
-        f"[TOKEN] Token still contains whitespace after strip (raw length={len(_raw_token)}, "
-        f"stripped length={len(TELEGRAM_BOT_TOKEN)}) — re-paste the token in Secrets."
-    )
-if ":" not in TELEGRAM_BOT_TOKEN:
-    raise ValueError(
-        f"[TOKEN] Token does not look valid (length={len(TELEGRAM_BOT_TOKEN)}, "
-        f"no ':' separator found) — copy it fresh from BotFather."
-    )
-_token_parts = TELEGRAM_BOT_TOKEN.split(":", 1)
-if not _token_parts[0].isdigit():
-    raise ValueError(
-        f"[TOKEN] Token prefix is not numeric (prefix={_token_parts[0]!r}) — copy it fresh from BotFather."
-    )
-print(
-    f"[TOKEN] OK — length={len(TELEGRAM_BOT_TOKEN)}, "
-    f"bot_id={_token_parts[0]}, "
-    f"secret_preview=...{_token_parts[1][-6:]}",
-    flush=True,
-)
+def _require_env(key: str, default: str = "") -> str:
+    val = os.environ.get(key, default).strip()
+    if not val and not default:
+        raise SystemExit(f"[FATAL] Missing required env var: {key}")
+    return val
 
-AIRTABLE_API_KEY = os.environ["AIRTABLE_API_KEY"]
-AIRTABLE_BASE_ID = os.environ.get("AIRTABLE_BASE_ID", "appa4GoH54MAPKcUT")
-AIRTABLE_TABLE_NAME = os.environ.get("AIRTABLE_TABLE_NAME", "tblqr6cf0PQA5Zwel")
+_raw_token = _require_env("TELEGRAM_BOT_TOKEN")
+if ":" not in _raw_token or not _raw_token.split(":")[0].isdigit():
+    raise SystemExit("[FATAL] TELEGRAM_BOT_TOKEN format invalid — re-paste from BotFather.")
+_bot_id = _raw_token.split(":")[0]
+log.info("[BOOT] Token OK — bot_id=%s suffix=...%s", _bot_id, _raw_token[-6:])
 
-bot = telebot.TeleBot(TELEGRAM_BOT_TOKEN)
+AIRTABLE_API_KEY    = _require_env("AIRTABLE_API_KEY")
+AIRTABLE_BASE_ID    = _require_env("AIRTABLE_BASE_ID",    "appa4GoH54MAPKcUT")
+AIRTABLE_TABLE_NAME = _require_env("AIRTABLE_TABLE_NAME", "tblqr6cf0PQA5Zwel")
+HEALTH_PORT         = int(os.environ.get("PORT", os.environ.get("BOT_PORT", "8080")))
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Thread pools  (separate to prevent text lookups starving saves or vice-versa)
+# ─────────────────────────────────────────────────────────────────────────────
+
+_TEXT_POOL = ThreadPoolExecutor(max_workers=6,  thread_name_prefix="text")
+_SAVE_POOL = ThreadPoolExecutor(max_workers=4,  thread_name_prefix="save")
+
+def _run_in(pool: ThreadPoolExecutor, fn, *args) -> None:
+    """Submit fn(*args) to pool. Handler returns instantly."""
+    pool.submit(fn, *args)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Clients
+# ─────────────────────────────────────────────────────────────────────────────
+
+bot      = telebot.TeleBot(_raw_token, threaded=True, num_threads=12)
 airtable = Api(AIRTABLE_API_KEY).table(AIRTABLE_BASE_ID, AIRTABLE_TABLE_NAME)
 
-# Per-chat conversation state:
-# {
-#   "step":       "awaiting_transaction" | "awaiting_name" | "awaiting_mobile",
-#   "record_id":  str | None,
-#   "full_name":  str | None   <- from OCR or typed by user
-# }
-user_state: dict[int, dict] = {}
+# ─────────────────────────────────────────────────────────────────────────────
+# Airtable warmup  (verify connectivity at startup, not mid-request)
+# ─────────────────────────────────────────────────────────────────────────────
 
-# ---------------------------------------------------------------------------
-# Success message
-# ---------------------------------------------------------------------------
+def _warmup_airtable() -> None:
+    t0 = time.monotonic()
+    try:
+        airtable.all(max_records=1)
+        log.info("[BOOT] Airtable connection OK  (%.2fs)", time.monotonic() - t0)
+    except Exception as exc:
+        log.warning("[BOOT] Airtable warmup failed (non-fatal): %s", exc)
 
-SUCCESS_MESSAGE_TEMPLATE = (
+# ─────────────────────────────────────────────────────────────────────────────
+# Conversation state   {chat_id: {"step", "record_id", "full_name"}}
+# Steps: awaiting_transaction → awaiting_name_city → awaiting_mobile
+# ─────────────────────────────────────────────────────────────────────────────
+
+_state_lock: threading.Lock = threading.Lock()
+_state: dict[int, dict]     = {}
+
+def _get(chat_id: int) -> Optional[dict]:
+    with _state_lock:
+        return _state.get(chat_id)
+
+def _put(chat_id: int, s: dict) -> None:
+    with _state_lock:
+        _state[chat_id] = s
+
+def _pop(chat_id: int) -> None:
+    with _state_lock:
+        _state.pop(chat_id, None)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Static strings
+# ─────────────────────────────────────────────────────────────────────────────
+
+_PLEASE_START = "እባክዎ 👉 /start ይጫኑ ለመጀመር።"
+
+_SUCCESS = (
     "✅ ምዝገባዎ በተሳካ ሁኔታ ተጠናቅቋል!\n"
     "\n"
     "🎫 የእርስዎ የዕጣ ቁጥር፦ <b>{lottery_number}</b>\n"
@@ -110,219 +156,47 @@ SUCCESS_MESSAGE_TEMPLATE = (
     "Facebook:\nhttp://facebook.com/share/1DwpPzF9bQ\n"
 )
 
-# ---------------------------------------------------------------------------
-# OCR helpers
-# ---------------------------------------------------------------------------
-
-_TXN_HEADERS = [
-    r"Reference\s*No\.?\s*\(VAT\s*Invoice\s*No\.?\)",
-    r"Reference\s*No\.?",
-    r"Transaction\s*ID",
-    r"Txn\s*ID",
-    r"Ref\.?\s*No\.?",
-]
-_TXN_HEADER_RE = re.compile(
-    r"(?:" + "|".join(_TXN_HEADERS) + r")\s*[:\-]?\s*([A-Za-z0-9]{6,})",
-    re.IGNORECASE,
-)
-# ── CBE Mobile / "debited from" pattern ─────────────────────────────────────
-# Uses [\s\S]+? (lazy, any character including newlines) so a triple Ethiopian
-# name spread over two OCR lines is captured in full.
-# Stops at the first occurrence of:
-#   – the word "for"  (e.g. "debited from SELAMAWIT TADESSE BEKELE for ...")
-#   – a hyphen / en-dash  (e.g. "...Gidey-ETB-9577")
-_DEBITED_FROM_RE = re.compile(
-    r"debited\s+from\s+"
-    r"([\s\S]+?)"
-    r"(?=\s+for\b|\s*[-–])",
-    re.IGNORECASE,
-)
-
-# Strips account/amount suffixes that OCR may attach to extracted names:
-#   "Gidey-ETB-9577"  →  "Gidey"
-#   "Gebru - 1000.00" →  "Gebru"
-_ACCOUNT_SUFFIX_RE = re.compile(
-    r"\s*[-–]\s*(?:ETB|USD|EUR|GBP|Birr)[\s\-–]\S+.*"
-    r"|\s*[-–]\s*\d[\d,\.]*.*",
-    re.IGNORECASE,
-)
-
-# ── Generic label-based name patterns ───────────────────────────────────────
-# Captures everything on the same line as the name label.
-_NAME_HEADER_RE = re.compile(
-    r"(?:Customer\s*Name|Payer\s*Name|Payer|Account\s*Name|Sender)\s*[:\-]?\s*([^\n]+)",
-    re.IGNORECASE,
-)
-
-# Labels that mark where a name value ends (stop before these).
-_NAME_STOP_RE = re.compile(
-    r"\s*(?:City|Region|Wereda|Phone|Mobile|Tel|Amount|Date|Bank|Address|Sub\s*City|for\b|to\b)\s*[:\-]?",
-    re.IGNORECASE,
-)
-
-_FT_BARE_RE = re.compile(r"\bFT[A-Z0-9]{4,}\b", re.IGNORECASE)
-
-
-def _preprocess_image(image: Image.Image) -> Image.Image:
-    w, h = image.size
-    # Crop the top 10 % of the image to skip the phone notification/status bar,
-    # which contains clocks, signal icons, and other noise that confuses OCR.
-    top_crop = int(h * 0.10)
-    image = image.crop((0, top_crop, w, h))
-    return image.convert("L").filter(ImageFilter.SHARPEN)
-
-
-def extract_data_from_image(photo_bytes: bytes) -> tuple[Optional[str], Optional[str]]:
-    """Return (transaction_id, customer_name), either may be None."""
-    image = _preprocess_image(Image.open(io.BytesIO(photo_bytes)))
-    raw_text = pytesseract.image_to_string(image, config="--psm 6")
-    # Always log the full raw OCR output for debugging purposes
-    print(f"[OCR RAW TEXT]:\n{'-'*60}\n{raw_text}\n{'-'*60}", flush=True)
-
-    # Transaction ID — header-prefixed match first, then bare FT token
-    transaction_id: Optional[str] = None
-    header_match = _TXN_HEADER_RE.search(raw_text)
-    if header_match:
-        candidate = header_match.group(1).upper().replace(" ", "")
-        if re.match(r"FT[A-Z0-9]+", candidate):
-            transaction_id = candidate
-    bare = _FT_BARE_RE.findall(raw_text)
-    if bare:
-        transaction_id = bare[0].upper()
-
-    # ── Customer name extraction ─────────────────────────────────────────────
-    customer_name: Optional[str] = None
-
-    def _clean_name(raw: str) -> Optional[str]:
-        """
-        1. Remove account/amount suffixes  e.g. "-ETB-9577" or "-9,000.00"
-        2. Stop at boundary field labels   e.g. "City:", "Region:"
-        3. Keep only valid name tokens:    letters, dots, forward-slashes
-           (preserves Ethiopian abbreviations like H/MARIAM, G/MICHAEL)
-        4. Title prefixes (Mr/Mrs/Ms/Dr) are kept as-is
-        """
-        # Step 1 — strip bank account / amount suffixes
-        raw = _ACCOUNT_SUFFIX_RE.sub("", raw).strip()
-        # Step 2 — stop before known boundary labels
-        stop = _NAME_STOP_RE.search(raw)
-        if stop:
-            raw = raw[: stop.start()]
-        # Step 3 — filter to name-like tokens (allow title words too)
-        tokens = [
-            t for t in raw.split()
-            if re.match(r"[A-Za-z][A-Za-z\./]*\.?$", t)
-        ]
-        return " ".join(tokens) if tokens else None
-
-    # Collapsed text (newlines → spaces) used for the label-based pattern which
-    # is single-line by nature. The debited-from regex uses raw_text directly
-    # because [\s\S]+? already crosses newlines natively.
-    collapsed = re.sub(r"\n+", " ", raw_text)
-
-    # Strip leading titles (Mr / Mrs / Ms / Dr, with or without dot) from a
-    # name before checking minimum length, so "Mr Yonas" passes the guard
-    # (core name "Yonas" is 5 chars) but "Mr" or "Mrs." alone is rejected.
-    _TITLE_PREFIX_RE = re.compile(
-        r"^(?:Mr\.?|Mrs\.?|Ms\.?|Dr\.?)\s+", re.IGNORECASE
-    )
-
-    def _name_passes_length(name: str) -> bool:
-        core = _TITLE_PREFIX_RE.sub("", name).strip()
-        return len(core) >= 3
-
-    # Priority 1: CBE Mobile "debited from NAME for/– ..."
-    # Search raw_text — [\s\S]+? handles names split across OCR lines natively.
-    debited_match = _DEBITED_FROM_RE.search(raw_text)
-    if debited_match:
-        # Normalise any embedded newlines in the captured group to a single space
-        raw_captured = re.sub(r"\s+", " ", debited_match.group(1)).strip()
-        candidate = _clean_name(raw_captured)
-        if candidate and _name_passes_length(candidate):
-            customer_name = candidate
-        elif candidate:
-            print(f"[OCR] Discarded too-short name from debited-from: {candidate!r}", flush=True)
-
-    # Priority 2: explicit label (Customer Name:, Payer Name:, Sender:, etc.)
-    if not customer_name:
-        label_match = _NAME_HEADER_RE.search(collapsed)
-        if label_match:
-            candidate = _clean_name(label_match.group(1))
-            if candidate and _name_passes_length(candidate):
-                customer_name = candidate
-            elif candidate:
-                print(f"[OCR] Discarded too-short name from label: {candidate!r}", flush=True)
-
-    print(
-        f"[OCR RESULT] Transaction ID={transaction_id!r}  Name={customer_name!r}",
-        flush=True,
-    )
-    return transaction_id, customer_name
-
-
-# ---------------------------------------------------------------------------
+# ─────────────────────────────────────────────────────────────────────────────
 # Airtable helpers
-# ---------------------------------------------------------------------------
+# ─────────────────────────────────────────────────────────────────────────────
 
-def find_record_by_transaction_id(transaction_id: str) -> Optional[dict]:
-    formula = match({"Transaction ID": transaction_id})
-    records = airtable.all(formula=formula, max_records=1)
+def _at_find(txn_id: str) -> Optional[dict]:
+    """Exact match lookup by Transaction ID. Returns first record or None."""
+    t0 = time.monotonic()
+    records = airtable.all(formula=match({"Transaction ID": txn_id}), max_records=1)
+    elapsed = time.monotonic() - t0
+    found   = bool(records)
+    log.info("[AIRTABLE] lookup txn=%-20s found=%-5s %.2fs", txn_id, found, elapsed)
     return records[0] if records else None
 
 
-def is_already_registered(fields: dict) -> bool:
-    """True if the record already has a Chat ID (i.e. previously claimed)."""
-    return bool(str(fields.get("Chat ID", "") or "").strip())
-
-
-def update_record(
-    record_id: str,
-    mobile: str,
-    chat_id: int,
-    full_name: Optional[str] = None,
-) -> dict:
-    update_fields: dict = {
+def _at_save(record_id: str, mobile: str, chat_id: int, full_name: Optional[str]) -> dict:
+    fields: dict = {
         "User mobile": mobile,
-        "Chat ID": str(chat_id),
-        "Status": "Verified",
+        "Chat ID":     str(chat_id),
+        "Status":      "Verified",
     }
     if full_name:
-        update_fields["Full Name"] = full_name
+        fields["Full Name"] = full_name
+    t0     = time.monotonic()
+    result = airtable.update(record_id, fields, typecast=True)
+    log.info("[AIRTABLE] save  record=%-20s %.2fs", record_id, time.monotonic() - t0)
+    return result
 
+
+def _already_registered(fields: dict) -> bool:
+    return bool(str(fields.get("Chat ID", "") or "").strip())
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Worker functions  (run inside thread pools, never in handlers)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _worker_lookup(chat_id: int, txn_id: str) -> None:
+    """FT ID lookup worker — runs in _TEXT_POOL."""
     try:
-        return airtable.update(record_id, update_fields, typecast=True)
+        record = _at_find(txn_id)
     except Exception as exc:
-        print(
-            f"[Airtable UPDATE ERROR] record_id={record_id!r} "
-            f"fields={update_fields!r}: {exc!r}",
-            flush=True,
-        )
-        traceback.print_exc()
-        raise
-
-
-# ---------------------------------------------------------------------------
-# Shared lookup (used by photo and manual-text paths)
-# ---------------------------------------------------------------------------
-
-def lookup_and_advance(
-    chat_id: int,
-    transaction_id: str,
-    full_name: Optional[str],
-    came_from_photo: bool,
-) -> None:
-    """
-    Validate the transaction ID in Airtable and move conversation state forward.
-
-    Photo path:  if valid → go straight to awaiting_mobile (name already known)
-    Manual path: if valid → go to awaiting_name first
-    """
-    try:
-        record = find_record_by_transaction_id(transaction_id)
-    except Exception as exc:
-        print(
-            f"[Airtable SEARCH ERROR] Transaction ID={transaction_id!r}: {exc!r}",
-            flush=True,
-        )
+        log.error("[ERROR] Airtable lookup chat=%s txn=%s: %s", chat_id, txn_id, exc)
         traceback.print_exc()
         bot.send_message(chat_id, "ስህተት ተፈጥሯል፣ እባክዎ ቆይተው ይሞክሩ።")
         return
@@ -330,344 +204,281 @@ def lookup_and_advance(
     if not record:
         bot.send_message(
             chat_id,
-            "ይቅርታ፣ ይህ የትራንዛክሽን ቁጥር አልተገኘም። "
-            "እባክዎ ትክክለኛ ደረሰኝ ይላኩ ወይም ቆይቶ ይሞክሩ።",
+            "ይቅርታ፣ ይህ Transaction ID አልተገኘም።\n"
+            "እባክዎ ትክክለኛ FT... ቁጥር ያስገቡ ወይም ቆይቶ ይሞክሩ።",
         )
         return
 
     fields = record.get("fields", {})
-    if is_already_registered(fields):
-        prev_name = html.escape(str(fields.get("Full Name", "") or "—"))
-        prev_mobile = html.escape(str(fields.get("User mobile", "") or "—"))
-        prev_lottery = html.escape(str(fields.get("Lottery number", "") or "—"))
-        duplicate_msg = (
-            "⚠️ <b>ይህ ደረሰኝ ቀድሞ ተመዝግቧል!</b>\n"
-            "\n"
-            "የቀድሞ ምዝገባ መረጃ፦\n"
-            f"ስም፦ {prev_name}\n"
-            f"ስልክ፦ {prev_mobile}\n"
-            f"የዕጣ ቁጥር፦ {prev_lottery}"
-        )
-        bot.send_message(chat_id, duplicate_msg, parse_mode="HTML")
-        user_state.pop(chat_id, None)
-        return
-
-    if came_from_photo and full_name:
-        # OCR found both ID and name — go straight to mobile
-        user_state[chat_id] = {
-            "step": "awaiting_mobile",
-            "record_id": record["id"],
-            "full_name": full_name,
-        }
-        bot.send_message(chat_id, "እባክዎ ስልክ ቁጥርዎን ያስገቡ (ቁጥር ብቻ)")
-    elif came_from_photo and not full_name:
-        # OCR found the ID but could not read the name — ask user to type it
-        user_state[chat_id] = {
-            "step": "awaiting_name",
-            "record_id": record["id"],
-            "full_name": None,
-        }
+    if _already_registered(fields):
+        p_name   = html.escape(str(fields.get("Full Name",      "") or "—"))
+        p_mobile = html.escape(str(fields.get("User mobile",    "") or "—"))
+        p_lotto  = html.escape(str(fields.get("Lottery number", "") or "—"))
         bot.send_message(
             chat_id,
-            "ይቅርታ፣ ስምዎን ከፎቶው ላይ ማንበብ አልቻልኩም። እባክዎ ሙሉ ስምዎን እዚህ ይጻፉልኝ?",
+            "⚠️ <b>ይህ Transaction ID ቀድሞ ተመዝግቧል!</b>\n"
+            "\n"
+            "የቀድሞ ምዝገባ መረጃ፦\n"
+            f"ስም፦ {p_name}\n"
+            f"ስልክ፦ {p_mobile}\n"
+            f"የዕጣ ቁጥር፦ {p_lotto}",
+            parse_mode="HTML",
         )
-    else:
-        # Manual entry — ask for name next
-        user_state[chat_id] = {
-            "step": "awaiting_name",
-            "record_id": record["id"],
-            "full_name": None,
-        }
-        bot.send_message(chat_id, "እባክዎ ሙሉ ስምዎን ያስገቡ")
-
-
-# ---------------------------------------------------------------------------
-# Telegram handlers
-# ---------------------------------------------------------------------------
-
-@bot.message_handler(commands=["start"])
-def handle_start(message: telebot.types.Message) -> None:
-    user_state[message.chat.id] = {
-        "step": "awaiting_transaction",
-        "record_id": None,
-        "full_name": None,
-    }
-    bot.send_message(
-        message.chat.id,
-        "እንኳን ደህና መጡ! 🎉\n"
-        "\n"
-        "እባክዎ የባንክ ደረሰኝ ፎቶ (Screenshot) ይላኩ ወይም የ Transaction ID ቁጥሩን ፅፈው ያስገቡ።\n"
-        "\n"
-        "ℹ️ <b>ማሳሰቢያ፦</b>\n"
-        "በደረሰኙ ላይ ያለውን ስም ቦቱ በቀጥታ እንዲያነብ ካልፈለጉ፣ ፎቶ አይላኩ።\n"
-        "ይልቁንም የ Transaction ID ቁጥሩን ብቻ በጽሁፍ ያስገቡ — ያኔ ስምዎን በእጅ እንዲያስገቡ ይጠየቃሉ።",
-        parse_mode="HTML",
-    )
-
-
-@bot.message_handler(content_types=["photo"])
-def handle_photo(message: telebot.types.Message) -> None:
-    chat_id = message.chat.id
-    state = user_state.get(chat_id)
-
-    if not state or state.get("step") != "awaiting_transaction":
-        bot.send_message(chat_id, "እባክዎ 👉 /start ይጫኑ ለመጀመር።")
+        _pop(chat_id)
         return
 
-    file_id = message.photo[-1].file_id
+    _put(chat_id, {
+        "step":      "awaiting_name_city",
+        "record_id": record["id"],
+        "full_name": None,
+    })
+    bot.send_message(chat_id, "እባክዎ ሙሉ ስምዎን እና የሚኖሩበትን ከተማ ያስገቡ።")
+
+
+def _worker_save(chat_id: int, record_id: str, mobile: str, full_name: Optional[str]) -> None:
+    """Registration save worker — runs in _SAVE_POOL."""
     try:
-        file_info = bot.get_file(file_id)
-        photo_bytes = bot.download_file(file_info.file_path)
+        updated = _at_save(record_id, mobile, chat_id, full_name)
     except Exception as exc:
-        print(f"[PHOTO DOWNLOAD ERROR]: {exc!r}", flush=True)
+        log.error("[ERROR] Airtable save chat=%s record=%s: %s", chat_id, record_id, exc)
+        traceback.print_exc()
         bot.send_message(chat_id, "ስህተት ተፈጥሯል፣ እባክዎ ቆይተው ይሞክሩ።")
         return
 
-    bot.send_message(chat_id, "ፎቶውን እያነበብኩ ነው፣ እባክዎ ይጠብቁ...")
-    transaction_id, customer_name = extract_data_from_image(photo_bytes)
-
-    if not transaction_id:
-        bot.send_message(
-            chat_id,
-            "ይቅርታ፣ ደረሰኙን ማንበብ አልቻልኩም። እባክዎ በደንብ የሚታይ ፎቶ ይላኩ "
-            "ወይም የ Transaction ID ቁጥሩን በእጅ ይጻፉ።",
-        )
-        return
-
-    confirmation = f"Transaction ID ተገኝቷል: {transaction_id}"
-    if customer_name:
-        confirmation += f"\nስም: {customer_name}"
-    bot.send_message(chat_id, confirmation)
-
-    lookup_and_advance(
+    lottery_number = updated.get("fields", {}).get("Lottery number", "")
+    bot.send_message(
         chat_id,
-        transaction_id,
-        full_name=customer_name,
-        came_from_photo=True,
+        _SUCCESS.format(lottery_number=html.escape(str(lottery_number))),
+        parse_mode="HTML",
+        disable_web_page_preview=False,
     )
+    _pop(chat_id)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Telegram handlers  — each handler MUST return in <200 ms
+# ─────────────────────────────────────────────────────────────────────────────
+
+@bot.message_handler(commands=["start"])
+def handle_start(message: telebot.types.Message) -> None:
+    t0         = time.monotonic()
+    chat_id    = message.chat.id
+    first_name = (
+        (message.from_user.first_name or "").strip()
+        if message.from_user else ""
+    )
+    _put(chat_id, {"step": "awaiting_transaction", "record_id": None, "full_name": None})
+    bot.send_message(
+        chat_id,
+        f"እንኳን ደህና መጡ! 🎉 {first_name}\n\n"
+        "እባክዎ የባንክ Transaction ID ቁጥሩን ፅፈው ያስገቡ። FT የሚጀምር",
+    )
+    log.info("[START] chat=%-12s user=%-15s %.3fs", chat_id, first_name, time.monotonic() - t0)
 
 
 @bot.message_handler(func=lambda m: True, content_types=["text"])
 def handle_text(message: telebot.types.Message) -> None:
     chat_id = message.chat.id
-    state = user_state.get(chat_id)
-    text = (message.text or "").strip()
+    state   = _get(chat_id)
+    text    = (message.text or "").strip()
 
     if not state:
-        bot.send_message(chat_id, "እባክዎ 👉 /start ይጫኑ ለመጀመር።")
+        bot.send_message(chat_id, _PLEASE_START)
         return
 
     step = state.get("step")
 
-    # ── Step 1: Transaction ID typed manually ────────────────────────────────
+    # ── 1. Transaction ID → TEXT_POOL lookup (non-blocking) ──────────────────
     if step == "awaiting_transaction":
-        lookup_and_advance(
-            chat_id,
-            text.upper(),
-            full_name=None,
-            came_from_photo=False,
-        )
+        if not text:
+            bot.send_message(chat_id, "እባክዎ Transaction ID ያስገቡ (FT የሚጀምር)")
+            return
+        log.info("[TEXT] lookup queued  chat=%-12s txn=%s", chat_id, text.upper())
+        _run_in(_TEXT_POOL, _worker_lookup, chat_id, text.upper())
         return
 
-    # ── Step 2 (manual only): Full Name ─────────────────────────────────────
-    if step == "awaiting_name":
+    # ── 2. Full name + city → pure state mutation, zero I/O ──────────────────
+    if step == "awaiting_name_city":
         if not text:
-            bot.send_message(chat_id, "እባክዎ ሙሉ ስምዎን ያስገቡ")
+            bot.send_message(chat_id, "እባክዎ ሙሉ ስምዎን እና የሚኖሩበትን ከተማ ያስገቡ።")
             return
         state["full_name"] = text
-        state["step"] = "awaiting_mobile"
+        state["step"]      = "awaiting_mobile"
+        _put(chat_id, state)
         bot.send_message(chat_id, "እባክዎ ስልክ ቁጥርዎን ያስገቡ (ቁጥር ብቻ)")
         return
 
-    # ── Step 3: Mobile number ────────────────────────────────────────────────
+    # ── 3. Mobile number → SAVE_POOL write (non-blocking) ────────────────────
     if step == "awaiting_mobile":
         record_id = state.get("record_id")
         if not record_id:
-            user_state.pop(chat_id, None)
-            bot.send_message(chat_id, "እባክዎ 👉 /start ይጫኑ ለመጀመር።")
+            _pop(chat_id)
+            bot.send_message(chat_id, _PLEASE_START)
             return
-
-        if not re.fullmatch(r"\d+", text):
-            bot.send_message(chat_id, "⚠️ እባክህ ሞባይል ቁጥርህ ብቻ አስገባ")
-            return  # loop — stay in awaiting_mobile
-
-        full_name = state.get("full_name")
-        try:
-            updated = update_record(record_id, text, chat_id, full_name=full_name)
-        except Exception:
-            bot.send_message(chat_id, "ስህተት ተፈጥሯል፣ እባክዎ ቆይተው ይሞክሩ።")
+        if not re.fullmatch(r"\d{7,15}", text):
+            bot.send_message(chat_id, "⚠️ ትክክለኛ ሞባይል ቁጥር ያስገቡ (ቁጥር ብቻ)")
             return
-
-        fields = updated.get("fields", {})
-        lottery_number = fields.get("Lottery number", "")
-
-        bot.send_message(
-            chat_id,
-            SUCCESS_MESSAGE_TEMPLATE.format(
-                lottery_number=html.escape(str(lottery_number))
-            ),
-            parse_mode="HTML",
-            disable_web_page_preview=False,
-        )
-        user_state.pop(chat_id, None)
+        log.info("[TEXT] save queued  chat=%-12s record=%s", chat_id, record_id)
+        _run_in(_SAVE_POOL, _worker_save, chat_id, record_id, text, state.get("full_name"))
         return
 
+    bot.send_message(chat_id, _PLEASE_START)
 
-# ---------------------------------------------------------------------------
+
+# Catch-all — photos, stickers, audio, video, documents, etc.
+@bot.message_handler(
+    content_types=[
+        "photo", "sticker", "document", "audio", "video",
+        "voice", "video_note", "location", "contact",
+        "animation", "poll", "dice", "venue", "game",
+    ]
+)
+def handle_unsupported(_: telebot.types.Message) -> None:
+    bot.send_message(_.chat.id, _PLEASE_START)
+
+
+@bot.callback_query_handler(func=lambda call: True)
+def handle_callback(call: telebot.types.CallbackQuery) -> None:
+    bot.answer_callback_query(call.id)
+    bot.send_message(call.message.chat.id, _PLEASE_START)
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Health-check HTTP server
-# ---------------------------------------------------------------------------
-# Replit's publishing system requires an HTTP endpoint to validate the
-# deployment before allowing publish. This tiny server satisfies that check
-# without interfering with the Telegram bot in any way.
+# Railway probes GET /healthz  and  GET /
+# ─────────────────────────────────────────────────────────────────────────────
+
+_STARTED_AT  = time.time()
+_HEALTH_JSON = b'{"status":"ok","service":"awche-lottery-bot"}'
 
 _LANDING_HTML = b"""<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Emunat Delala Lottery</title>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Awche Lottery Bot</title>
 <style>
 *{box-sizing:border-box;margin:0;padding:0}
-body{font-family:'Segoe UI',Tahoma,Geneva,Verdana,sans-serif;
-  background:linear-gradient(135deg,#0f2027,#203a43,#2c5364);
+body{font-family:'Segoe UI',sans-serif;background:linear-gradient(135deg,#0f2027,#2c5364);
   min-height:100vh;display:flex;flex-direction:column;align-items:center;color:#fff}
-header{width:100%;background:rgba(0,0,0,.35);padding:18px 32px;
-  border-bottom:1px solid rgba(255,255,255,.08)}
-header h1{font-size:1.4rem;font-weight:700}
-.dot{display:inline-block;width:8px;height:8px;background:#4caf50;
-  border-radius:50%;margin-right:6px}
-.status{font-size:.85rem;color:#ffd700;font-weight:600;margin-top:4px}
-.hero{text-align:center;padding:60px 24px 40px;max-width:680px;width:100%}
-.badge{display:inline-block;background:#ffd700;color:#1a1a1a;font-weight:700;
-  font-size:.78rem;padding:4px 14px;border-radius:20px;letter-spacing:1px;
-  text-transform:uppercase;margin-bottom:20px}
-h2{font-size:2.4rem;font-weight:800;line-height:1.2;margin-bottom:16px}
+header{width:100%;background:rgba(0,0,0,.35);padding:16px 28px;
+  border-bottom:1px solid rgba(255,255,255,.08);display:flex;align-items:center;gap:10px}
+.dot{width:9px;height:9px;background:#4caf50;border-radius:50%;flex-shrink:0}
+header h1{font-size:1.2rem;font-weight:700}
+.hero{text-align:center;padding:60px 24px 32px;max-width:600px}
+.badge{display:inline-block;background:#ffd700;color:#111;font-weight:700;font-size:.75rem;
+  padding:4px 14px;border-radius:20px;letter-spacing:1px;text-transform:uppercase;margin-bottom:18px}
+h2{font-size:2.2rem;font-weight:800;line-height:1.2;margin-bottom:14px}
 h2 span{color:#ffd700}
-.desc{font-size:1.05rem;color:rgba(255,255,255,.75);line-height:1.7;margin-bottom:32px}
-.draw-box{background:rgba(255,215,0,.12);border:1px solid rgba(255,215,0,.35);
-  border-radius:12px;padding:16px 28px;display:inline-block;margin-bottom:36px}
-.draw-label{font-size:.78rem;color:#ffd700;text-transform:uppercase;letter-spacing:1px}
-.draw-date{font-size:1.5rem;font-weight:800;margin-top:4px}
-.tg-btn{display:inline-flex;align-items:center;gap:10px;background:#229ED9;
-  color:#fff;font-size:1.05rem;font-weight:700;padding:16px 36px;border-radius:50px;
-  text-decoration:none;box-shadow:0 4px 24px rgba(34,158,217,.45)}
-.steps{width:100%;max-width:820px;padding:0 24px 60px;
-  display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:20px}
-.step{background:rgba(255,255,255,.06);border:1px solid rgba(255,255,255,.1);
-  border-radius:16px;padding:28px 24px;text-align:center}
-.step-icon{font-size:2rem;margin-bottom:14px}
-.step-title{font-size:1rem;font-weight:700;color:#ffd700;margin-bottom:8px}
-.step-desc{font-size:.88rem;color:rgba(255,255,255,.65);line-height:1.6}
-.socials{display:flex;gap:16px;justify-content:center;padding:0 24px 48px;flex-wrap:wrap}
-.social-link{display:inline-flex;align-items:center;gap:8px;
-  background:rgba(255,255,255,.08);border:1px solid rgba(255,255,255,.15);
-  color:#fff;text-decoration:none;padding:10px 20px;border-radius:50px;
-  font-size:.88rem;font-weight:600}
-footer{width:100%;text-align:center;padding:20px;font-size:.8rem;
-  color:rgba(255,255,255,.35);border-top:1px solid rgba(255,255,255,.08)}
+p{color:rgba(255,255,255,.7);line-height:1.7;margin-bottom:28px}
+.btn{display:inline-flex;align-items:center;gap:8px;background:#229ED9;color:#fff;
+  font-size:1rem;font-weight:700;padding:14px 32px;border-radius:50px;text-decoration:none;
+  box-shadow:0 4px 20px rgba(34,158,217,.4)}
+footer{margin-top:auto;padding:18px;font-size:.75rem;color:rgba(255,255,255,.3);
+  border-top:1px solid rgba(255,255,255,.07);width:100%;text-align:center}
 </style>
 </head>
 <body>
-<header>
-  <h1>Emunat Delala Lottery</h1>
-  <div class="status"><span class="dot"></span>Bot Online &amp; Accepting Registrations</div>
-</header>
+<header><div class="dot"></div><h1>Awche Lottery Bot &mdash; Online</h1></header>
 <div class="hero">
   <div class="badge">Official Registration</div>
   <h2>Register for the<br><span>Lucky Draw</span></h2>
-  <p class="desc">Participate in the Emunat Delala Lottery by sending your CBE Mobile Banking
-  receipt photo to our Telegram bot. Your Transaction ID is verified instantly and you receive
-  your lottery number right away.</p>
-  <div class="draw-box">
-    <div class="draw-label">Draw Date</div>
-    <div class="draw-date">&#4661;&#4637; 5 / 2018 E.C.</div>
-  </div><br>
-  <a class="tg-btn" href="https://t.me/emunat_lottery_bot" target="_blank" rel="noopener">
-    <svg width="22" height="22" viewBox="0 0 24 24" fill="#fff">
-      <path d="M12 0C5.373 0 0 5.373 0 12s5.373 12 12 12 12-5.373 12-12S18.627 0 12 0zm5.562
-      8.247-1.97 9.289c-.145.658-.537.818-1.084.508l-3-2.21-1.447 1.394c-.16.16-.295.295-.605.295l.213-3.053
-      5.56-5.023c.242-.213-.054-.333-.373-.12l-6.871 4.326-2.962-.924c-.643-.204-.657-.643.136-.953l11.57-4.461c.537-.194
-      1.006.131.833.932z"/>
-    </svg>
-    Register via Telegram Bot
+  <p>Type your CBE Mobile Banking Transaction ID in our Telegram bot.
+  Your payment is verified instantly and you receive your lottery number right away.</p>
+  <a class="btn" href="https://t.me/+hNcPdZTTL-xhMjhk" target="_blank" rel="noopener">
+    &#128172; Join on Telegram
   </a>
 </div>
-<div class="steps">
-  <div class="step"><div class="step-icon">&#128248;</div>
-    <div class="step-title">Step 1 &mdash; Send Receipt</div>
-    <div class="step-desc">Open the bot and send a photo of your CBE Mobile Banking payment receipt,
-    or type your Transaction ID manually.</div></div>
-  <div class="step"><div class="step-icon">&#9989;</div>
-    <div class="step-title">Step 2 &mdash; Verify</div>
-    <div class="step-desc">The bot reads your Transaction ID automatically using OCR and checks it
-    against our verified payment records.</div></div>
-  <div class="step"><div class="step-icon">&#127967;</div>
-    <div class="step-title">Step 3 &mdash; Get Your Number</div>
-    <div class="step-desc">Once confirmed, your name and mobile number are saved and you instantly
-    receive your unique lottery number.</div></div>
-  <div class="step"><div class="step-icon">&#128250;</div>
-    <div class="step-title">Step 4 &mdash; Watch the Draw</div>
-    <div class="step-desc">Follow our Facebook, YouTube, or TikTok on draw day &mdash;
-    &#4661;&#4637; 5/2018 &mdash; to see if your number wins!</div></div>
-</div>
-<div class="socials">
-  <a class="social-link" href="https://www.facebook.com/share/18335v162t/" target="_blank" rel="noopener">&#128280; Facebook</a>
-  <a class="social-link" href="https://youtube.com/@emunatdelala" target="_blank" rel="noopener">&#9654;&#65039; YouTube</a>
-  <a class="social-link" href="https://www.tiktok.com/@emunat.com" target="_blank" rel="noopener">&#127925; TikTok</a>
-</div>
-<footer>&copy; 2024 Emunat Delala Lottery &mdash; All rights reserved</footer>
+<footer>&copy; 2024 Awche Lottery &mdash; All rights reserved</footer>
 </body>
 </html>"""
 
 
 class _HealthHandler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:
-        if self.path in ("/healthz", "/api/healthz"):
-            body = b"OK"
-            content_type = "text/plain"
+        path = self.path.split("?")[0]
+        if path in ("/healthz", "/health", "/api/healthz"):
+            uptime = int(time.time() - _STARTED_AT)
+            body   = (
+                b'{"status":"ok","uptime_seconds":' + str(uptime).encode() + b"}"
+            )
+            ctype  = "application/json"
+        elif path == "/ready":
+            body, ctype = b"READY", "text/plain"
         else:
-            body = _LANDING_HTML
-            content_type = "text/html; charset=utf-8"
+            body, ctype = _LANDING_HTML, "text/html; charset=utf-8"
         self.send_response(200)
-        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-cache")
         self.end_headers()
         self.wfile.write(body)
 
-    def log_message(self, format: str, *args: object) -> None:
-        pass  # silence default access logs
+    def log_message(self, fmt: str, *args: object) -> None:
+        pass  # suppress per-request noise; Railway monitors stdout
 
 
-class _ReuseAddrHTTPServer(HTTPServer):
-    """HTTPServer with SO_REUSEADDR set before bind so restarts don't fail."""
+class _ReuseServer(HTTPServer):
     allow_reuse_address = True
 
 
-def _start_health_server() -> None:
-    port = int(os.environ.get("BOT_PORT", 8082))
+def _run_health_server() -> None:
     try:
-        server = _ReuseAddrHTTPServer(("0.0.0.0", port), _HealthHandler)
+        srv = _ReuseServer(("0.0.0.0", HEALTH_PORT), _HealthHandler)
+        log.info("[BOOT] Health server on port %d", HEALTH_PORT)
+        srv.serve_forever()
     except OSError:
-        # Port already bound (e.g. second call after a bot restart) — the
-        # existing server thread is still serving, nothing to do.
-        logger.debug("Health server port %d already in use — keeping existing server", port)
-        return
-    logger.info("Health-check server listening on port %d", port)
-    server.serve_forever()
+        log.warning("[BOOT] Health server port %d already in use — skipping", HEALTH_PORT)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Graceful shutdown
+# ─────────────────────────────────────────────────────────────────────────────
+
+_shutdown_event = threading.Event()
 
 
-# ---------------------------------------------------------------------------
-# Entry point
-# ---------------------------------------------------------------------------
+def _handle_sigterm(*_) -> None:
+    log.info("[SHUTDOWN] SIGTERM received — stopping bot cleanly")
+    _shutdown_event.set()
+    bot.stop_polling()
+    _TEXT_POOL.shutdown(wait=False)
+    _SAVE_POOL.shutdown(wait=False)
+    sys.exit(0)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Entry point with reconnect loop
+# ─────────────────────────────────────────────────────────────────────────────
 
 def main() -> None:
-    # Start the health-check server in a daemon thread so it exits cleanly
-    # when the main process stops.
-    health_thread = threading.Thread(target=_start_health_server, daemon=True)
-    health_thread.start()
+    signal.signal(signal.SIGTERM, _handle_sigterm)
+    signal.signal(signal.SIGINT,  _handle_sigterm)
 
-    logger.info("Bot is running. Press Ctrl+C to stop.")
-    bot.infinity_polling(skip_pending=True)
+    # Start health server
+    threading.Thread(target=_run_health_server, daemon=True).start()
+
+    # Warm up Airtable connection (non-blocking — runs in text pool)
+    _TEXT_POOL.submit(_warmup_airtable)
+
+    log.info("[BOOT] Bot starting — bot_id=%s", _bot_id)
+
+    reconnect_delay = 5  # seconds between reconnect attempts
+    while not _shutdown_event.is_set():
+        try:
+            log.info("[POLL] Starting infinity_polling (skip_pending=True)")
+            bot.infinity_polling(
+                skip_pending=True,
+                timeout=20,
+                long_polling_timeout=20,
+                logger_level=logging.WARNING,
+            )
+        except Exception as exc:
+            if _shutdown_event.is_set():
+                break
+            log.error("[POLL] Polling crashed: %s — reconnecting in %ds", exc, reconnect_delay)
+            time.sleep(reconnect_delay)
+            reconnect_delay = min(reconnect_delay * 2, 60)  # exponential back-off, cap 60s
+        else:
+            reconnect_delay = 5  # reset after clean exit
+
+    log.info("[SHUTDOWN] Bot stopped.")
 
 
 if __name__ == "__main__":
