@@ -2,11 +2,11 @@
 Awche Lottery — Telegram Bot  (Railway / Production)
 -----------------------------------------------------
 Flow:
-  /start → ask Transaction ID (FT...)
-  FT ID  → Airtable exact lookup → ask Full Name + City
-  Name   → ask Mobile number
-  Mobile → save to Airtable → return Lottery number
+  /start       → personalized welcome → ask FT Transaction ID
+  FT ID (text) → Airtable exact lookup → ask Full Name + City
+  Name + City  → save Full Name, City, Telegram Username, Chat ID → success
 
+Catch-all: any message/button outside the sequence → prompt /start
 Pure polling worker — no HTTP server, no PORT binding.
 """
 
@@ -15,7 +15,6 @@ from __future__ import annotations
 import html
 import logging
 import os
-import re
 import sys
 
 from telegram import Update
@@ -57,7 +56,7 @@ table = Api(AIRTABLE_KEY).table(AIRTABLE_BASE, AIRTABLE_TABLE)
 
 # ── ConversationHandler states ────────────────────────────────────────────────
 
-AWAITING_TRANSACTION, AWAITING_NAME_CITY, AWAITING_MOBILE = range(3)
+AWAITING_TRANSACTION, AWAITING_NAME_CITY = range(2)
 
 # ── Static messages ───────────────────────────────────────────────────────────
 
@@ -87,15 +86,17 @@ _SUCCESS = (
 # ── Handlers ──────────────────────────────────────────────────────────────────
 
 async def start(update: Update, context) -> int:
+    """Entry point — greet user and ask for Transaction ID."""
     first_name = (update.effective_user.first_name or "").strip()
     await update.message.reply_text(
         f"እንኳን ደህና መጡ! 🎉 {first_name}\n\n"
-        "እባክዎ የባንክ Transaction ID ቁጥሩን ፅፈው ያስገቡ። FT የሚጀምር"
+        "እባክዎ የባንክ ደረሰኝ የ Transaction ID ቁጥሩን ፅፈው ይላኩ FT የሚጀምር።"
     )
     return AWAITING_TRANSACTION
 
 
 async def receive_transaction(update: Update, context) -> int:
+    """Step 1 — look up the Transaction ID in Airtable."""
     txn_id = (update.message.text or "").strip().upper()
     if not txn_id:
         await update.message.reply_text("እባክዎ Transaction ID ያስገቡ (FT የሚጀምር)")
@@ -121,51 +122,44 @@ async def receive_transaction(update: Update, context) -> int:
 
     # Already registered?
     if str(fields.get("Chat ID", "") or "").strip():
-        p_name   = html.escape(str(fields.get("Full Name",      "") or "—"))
-        p_mobile = html.escape(str(fields.get("User mobile",    "") or "—"))
-        p_lotto  = html.escape(str(fields.get("Lottery number", "") or "—"))
+        p_name  = html.escape(str(fields.get("Full Name",      "") or "—"))
+        p_lotto = html.escape(str(fields.get("Lottery number", "") or "—"))
         await update.message.reply_text(
             "⚠️ <b>ይህ Transaction ID ቀድሞ ተመዝግቧል!</b>\n\n"
             f"ስም፦ {p_name}\n"
-            f"ስልክ፦ {p_mobile}\n"
             f"የዕጣ ቁጥር፦ {p_lotto}",
             parse_mode="HTML",
         )
         return ConversationHandler.END
 
     context.user_data["record_id"] = record["id"]
-    await update.message.reply_text("እባክዎ ሙሉ ስምዎን እና የሚኖሩበትን ከተማ ያስገቡ።")
+    await update.message.reply_text("እባክዎ ሙሉ ስምዎትና የሚኖሩት ከተማ ያስገቡ")
     return AWAITING_NAME_CITY
 
 
 async def receive_name_city(update: Update, context) -> int:
+    """Step 2 — save Full Name, City, Telegram Username, Chat ID → show success."""
     text = (update.message.text or "").strip()
     if not text:
-        await update.message.reply_text("እባክዎ ሙሉ ስምዎን እና የሚኖሩበትን ከተማ ያስገቡ።")
+        await update.message.reply_text("እባክዎ ሙሉ ስምዎትና የሚኖሩት ከተማ ያስገቡ")
         return AWAITING_NAME_CITY
 
-    context.user_data["full_name"] = text
-    await update.message.reply_text("እባክዎ ስልክ ቁጥርዎን ያስገቡ (ቁጥር ብቻ)")
-    return AWAITING_MOBILE
-
-
-async def receive_mobile(update: Update, context) -> int:
-    mobile = (update.message.text or "").strip()
-    if not re.fullmatch(r"\d{7,15}", mobile):
-        await update.message.reply_text("⚠️ ትክክለኛ ሞባይል ቁጥር ያስገቡ (ቁጥር ብቻ)")
-        return AWAITING_MOBILE
-
     record_id = context.user_data.get("record_id")
-    full_name  = context.user_data.get("full_name", "")
-    chat_id    = update.effective_chat.id
+    if not record_id:
+        await update.message.reply_text(_PLEASE_START)
+        return ConversationHandler.END
 
-    log.info("save record=%s chat=%s", record_id, chat_id)
+    user     = update.effective_user
+    chat_id  = update.effective_chat.id
+    username = f"@{user.username}" if (user and user.username) else ""
+
+    log.info("save record=%s chat=%s username=%s", record_id, chat_id, username)
     try:
         updated = table.update(record_id, {
-            "User mobile": mobile,
-            "Chat ID":     str(chat_id),
-            "Status":      "Verified",
-            "Full Name":   full_name,
+            "Full Name":         text,
+            "Chat ID":           str(chat_id),
+            "Status":            "Verified",
+            "Telegram Username": username,
         }, typecast=True)
     except Exception as exc:
         log.error("Airtable save failed: %s", exc)
@@ -183,18 +177,30 @@ async def receive_mobile(update: Update, context) -> int:
     return ConversationHandler.END
 
 
-async def fallback(update: Update, context) -> int:
+async def conv_fallback(update: Update, context) -> int:
+    """Fired for any unrecognised input WITHIN an active conversation."""
     await update.message.reply_text(_PLEASE_START)
     return ConversationHandler.END
 
 
-# ── Entry point ───────────────────────────────────────────────────────────────
+async def global_catch_all(update: Update, context) -> None:
+    """Fired for any message/callback that arrives OUTSIDE the conversation
+    (i.e. user has not yet typed /start, or conversation already ended)."""
+    if update.message:
+        await update.message.reply_text(_PLEASE_START)
+    elif update.callback_query:
+        await update.callback_query.answer()
+        await update.callback_query.message.reply_text(_PLEASE_START)
+
+
+# ── Application ───────────────────────────────────────────────────────────────
 
 def main() -> None:
     log.info("Bot starting…")
 
     app = Application.builder().token(TOKEN).build()
 
+    # ── Conversation ─────────────────────────────────────────────────────────
     conv = ConversationHandler(
         entry_points=[CommandHandler("start", start)],
         states={
@@ -204,18 +210,19 @@ def main() -> None:
             AWAITING_NAME_CITY: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, receive_name_city)
             ],
-            AWAITING_MOBILE: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, receive_mobile)
-            ],
         },
         fallbacks=[
-            CommandHandler("start", start),
-            MessageHandler(filters.ALL, fallback),
+            CommandHandler("start", start),           # /start restarts anytime
+            MessageHandler(filters.ALL, conv_fallback),
         ],
         allow_reentry=True,
     )
-
     app.add_handler(conv)
+
+    # ── Global catch-all (outside conversation) ───────────────────────────────
+    # Registered AFTER the ConversationHandler so it only fires when no
+    # conversation state is active (user hasn't started yet, or flow ended).
+    app.add_handler(MessageHandler(filters.ALL, global_catch_all))
 
     log.info("Polling started (drop_pending_updates=True)")
     app.run_polling(drop_pending_updates=True)
