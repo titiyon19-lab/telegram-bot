@@ -1,2 +1,2 @@
-python-telegram-bot>=20.0
-pyairtable>=2.0.0
+python-telegram-bot==20.8
+pyairtable==2.3.3
