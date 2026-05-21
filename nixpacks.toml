@@ -1,2 +1,2 @@
 [start]
-cmd = "python telegram_lottery_bot.py"
+cmd = "python main.py"

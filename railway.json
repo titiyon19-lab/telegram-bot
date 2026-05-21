@@ -4,9 +4,7 @@
     "builder": "NIXPACKS"
   },
   "deploy": {
-    "startCommand": "python telegram_lottery_bot.py",
-    "healthcheckPath": "/healthz",
-    "healthcheckTimeout": 30,
+    "startCommand": "python main.py",
     "restartPolicyType": "ON_FAILURE",
     "restartPolicyMaxRetries": 10
   }

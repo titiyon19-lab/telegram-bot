@@ -1,1 +1,1 @@
-web: python telegram_lottery_bot.py
+worker: python main.py

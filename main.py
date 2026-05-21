@@ -1,102 +1,225 @@
 """
-Production entry point for Reserved VM deployment.
+Awche Lottery — Telegram Bot  (Railway / Production)
+-----------------------------------------------------
+Flow:
+  /start → ask Transaction ID (FT...)
+  FT ID  → Airtable exact lookup → ask Full Name + City
+  Name   → ask Mobile number
+  Mobile → save to Airtable → return Lottery number
 
-The health server starts on 0.0.0.0:PORT *before* any bot code is imported,
-so the GCE health probe always gets an immediate HTTP 200 regardless of
-whether the bot token/secrets are present or the bot crashes.
-
-The bot then runs in a retry loop:
-  - 409 Conflict   → 60 s wait (lets the previous polling session expire)
-  - Any other crash → exponential back-off (5 s .. 30 s)
+Pure polling worker — no HTTP server, no PORT binding.
 """
+
+from __future__ import annotations
+
+import html
 import logging
 import os
-import threading
-import time
-from http.server import BaseHTTPRequestHandler, HTTPServer
+import re
+import sys
+
+from telegram import Update
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    ConversationHandler,
+    MessageHandler,
+    filters,
+)
+from pyairtable import Api
+from pyairtable.formulas import match
+
+# ── Logging ───────────────────────────────────────────────────────────────────
 
 logging.basicConfig(
+    stream=sys.stdout,
     level=logging.INFO,
-    format="%(asctime)s [main] %(levelname)s %(message)s",
+    format="%(asctime)s [%(levelname)s] %(message)s",
 )
-log = logging.getLogger("main")
+log = logging.getLogger("awche_bot")
 
-# ---------------------------------------------------------------------------
-# Minimal health server — starts BEFORE the bot is imported
-# ---------------------------------------------------------------------------
+# ── Environment ───────────────────────────────────────────────────────────────
 
-HEALTH_PAGE = b"""<!DOCTYPE html>
-<html lang="en">
-<head><meta charset="utf-8"><title>Emunat Delala Lottery Bot</title></head>
-<body style="font-family:sans-serif;text-align:center;padding:60px">
-<h1>&#127881; Emunat Delala Lottery</h1>
-<p>Telegram lottery bot is running 24/7.</p>
-<p><a href="https://t.me/EmunatLotteryBot">Open in Telegram</a></p>
-</body>
-</html>"""
+def _env(key: str, default: str = "") -> str:
+    val = os.environ.get(key, default).strip()
+    if not val and not default:
+        raise SystemExit(f"[FATAL] Missing env var: {key}")
+    return val
+
+TOKEN          = _env("TELEGRAM_BOT_TOKEN")
+AIRTABLE_KEY   = _env("AIRTABLE_API_KEY")
+AIRTABLE_BASE  = _env("AIRTABLE_BASE_ID",    "appa4GoH54MAPKcUT")
+AIRTABLE_TABLE = _env("AIRTABLE_TABLE_NAME", "tblqr6cf0PQA5Zwel")
+
+# ── Airtable client ───────────────────────────────────────────────────────────
+
+table = Api(AIRTABLE_KEY).table(AIRTABLE_BASE, AIRTABLE_TABLE)
+
+# ── ConversationHandler states ────────────────────────────────────────────────
+
+AWAITING_TRANSACTION, AWAITING_NAME_CITY, AWAITING_MOBILE = range(3)
+
+# ── Static messages ───────────────────────────────────────────────────────────
+
+_PLEASE_START = "እባክዎ 👉 /start ይጫኑ ለመጀመር።"
+
+_SUCCESS = (
+    "✅ ምዝገባዎ በተሳካ ሁኔታ ተጠናቅቋል!\n"
+    "\n"
+    "🎫 የእርስዎ የዕጣ ቁጥር፦ <b>{lottery_number}</b>\n"
+    "\n"
+    "🍀 መልካም ዕድል!\n"
+    "\n"
+    "━━━━━━━━━━━━━━━━━━\n"
+    "ዓውቸ Online Lottery\n"
+    "\n"
+    "📺 ዕጣው በቀጥታ (Live) የሚተላለፍባቸው አድራሻዎች፦\n"
+    "\n"
+    "Telegram:\nhttps://t.me/+hNcPdZTTL-xhMjhk\n"
+    "\n"
+    "YouTube:\nhttps://youtube.com/@awuchetube?si=gS48mTKirCFoFSRK\n"
+    "\n"
+    "TikTok:\nhttps://www.tiktok.com/@awuch66\n"
+    "\n"
+    "Facebook:\nhttp://facebook.com/share/1DwpPzF9bQ"
+)
+
+# ── Handlers ──────────────────────────────────────────────────────────────────
+
+async def start(update: Update, context) -> int:
+    first_name = (update.effective_user.first_name or "").strip()
+    await update.message.reply_text(
+        f"እንኳን ደህና መጡ! 🎉 {first_name}\n\n"
+        "እባክዎ የባንክ Transaction ID ቁጥሩን ፅፈው ያስገቡ። FT የሚጀምር"
+    )
+    return AWAITING_TRANSACTION
 
 
-class _Handler(BaseHTTPRequestHandler):
-    def do_GET(self):
-        if self.path in ("/healthz", "/api/healthz"):
-            body = b"OK"
-        else:
-            body = HEALTH_PAGE
-        self.send_response(200)
-        self.send_header("Content-Type",
-                         "text/plain" if body == b"OK" else "text/html; charset=utf-8")
-        self.send_header("Content-Length", str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
+async def receive_transaction(update: Update, context) -> int:
+    txn_id = (update.message.text or "").strip().upper()
+    if not txn_id:
+        await update.message.reply_text("እባክዎ Transaction ID ያስገቡ (FT የሚጀምር)")
+        return AWAITING_TRANSACTION
 
-    def log_message(self, fmt, *args):  # silence per-request logs
-        pass
-
-
-def _start_health_server(port: int) -> None:
+    log.info("lookup txn=%s chat=%s", txn_id, update.effective_chat.id)
     try:
-        server = HTTPServer(("0.0.0.0", port), _Handler)
-        log.info("Health server listening on 0.0.0.0:%d", port)
-        server.serve_forever()
-    except OSError as exc:
-        log.warning("Health server could not bind to port %d: %s", port, exc)
+        records = table.all(formula=match({"Transaction ID": txn_id}), max_records=1)
+    except Exception as exc:
+        log.error("Airtable lookup failed: %s", exc)
+        await update.message.reply_text("ስህተት ተፈጥሯል፣ እባክዎ ቆይተው ይሞክሩ።")
+        return ConversationHandler.END
+
+    if not records:
+        await update.message.reply_text(
+            "ይቅርታ፣ ይህ Transaction ID አልተገኘም።\n"
+            "እባክዎ ትክክለኛ FT... ቁጥር ያስገቡ ወይም ቆይቶ ይሞክሩ።"
+        )
+        return AWAITING_TRANSACTION
+
+    record = records[0]
+    fields = record.get("fields", {})
+
+    # Already registered?
+    if str(fields.get("Chat ID", "") or "").strip():
+        p_name   = html.escape(str(fields.get("Full Name",      "") or "—"))
+        p_mobile = html.escape(str(fields.get("User mobile",    "") or "—"))
+        p_lotto  = html.escape(str(fields.get("Lottery number", "") or "—"))
+        await update.message.reply_text(
+            "⚠️ <b>ይህ Transaction ID ቀድሞ ተመዝግቧል!</b>\n\n"
+            f"ስም፦ {p_name}\n"
+            f"ስልክ፦ {p_mobile}\n"
+            f"የዕጣ ቁጥር፦ {p_lotto}",
+            parse_mode="HTML",
+        )
+        return ConversationHandler.END
+
+    context.user_data["record_id"] = record["id"]
+    await update.message.reply_text("እባክዎ ሙሉ ስምዎን እና የሚኖሩበትን ከተማ ያስገቡ።")
+    return AWAITING_NAME_CITY
 
 
-# ---------------------------------------------------------------------------
-# Bot runner
-# ---------------------------------------------------------------------------
+async def receive_name_city(update: Update, context) -> int:
+    text = (update.message.text or "").strip()
+    if not text:
+        await update.message.reply_text("እባክዎ ሙሉ ስምዎን እና የሚኖሩበትን ከተማ ያስገቡ።")
+        return AWAITING_NAME_CITY
 
-def run() -> None:
-    port = int(os.environ.get("PORT", "24816"))
-    os.environ["BOT_PORT"] = str(port)
+    context.user_data["full_name"] = text
+    await update.message.reply_text("እባክዎ ስልክ ቁጥርዎን ያስገቡ (ቁጥር ብቻ)")
+    return AWAITING_MOBILE
 
-    # Start health server in a daemon thread RIGHT NOW — before any bot import
-    t = threading.Thread(target=_start_health_server, args=(port,), daemon=True)
-    t.start()
 
-    attempt = 0
-    while True:
-        attempt += 1
-        log.info("Starting Telegram bot (attempt %d) …", attempt)
-        try:
-            # Import inside the loop so a restart re-executes module-level setup
-            from telegram_lottery_bot import main as bot_main  # type: ignore[import]
-            bot_main()
-            log.warning("Bot stopped cleanly — restarting in 5 s …")
-            time.sleep(5)
-        except Exception as exc:
-            err = str(exc)
-            if "409" in err or "Conflict" in err:
-                wait = 60
-                log.warning(
-                    "409 Conflict — another instance is polling. "
-                    "Waiting %d s before retrying …", wait,
-                )
-            else:
-                wait = min(30, 5 * attempt)
-                log.error("Bot crashed: %s — retrying in %d s …", exc, wait)
-            time.sleep(wait)
+async def receive_mobile(update: Update, context) -> int:
+    mobile = (update.message.text or "").strip()
+    if not re.fullmatch(r"\d{7,15}", mobile):
+        await update.message.reply_text("⚠️ ትክክለኛ ሞባይል ቁጥር ያስገቡ (ቁጥር ብቻ)")
+        return AWAITING_MOBILE
+
+    record_id = context.user_data.get("record_id")
+    full_name  = context.user_data.get("full_name", "")
+    chat_id    = update.effective_chat.id
+
+    log.info("save record=%s chat=%s", record_id, chat_id)
+    try:
+        updated = table.update(record_id, {
+            "User mobile": mobile,
+            "Chat ID":     str(chat_id),
+            "Status":      "Verified",
+            "Full Name":   full_name,
+        }, typecast=True)
+    except Exception as exc:
+        log.error("Airtable save failed: %s", exc)
+        await update.message.reply_text("ስህተት ተፈጥሯል፣ እባክዎ ቆይተው ይሞክሩ።")
+        return ConversationHandler.END
+
+    lottery_number = html.escape(
+        str(updated.get("fields", {}).get("Lottery number", "") or "")
+    )
+    await update.message.reply_text(
+        _SUCCESS.format(lottery_number=lottery_number),
+        parse_mode="HTML",
+        disable_web_page_preview=False,
+    )
+    return ConversationHandler.END
+
+
+async def fallback(update: Update, context) -> int:
+    await update.message.reply_text(_PLEASE_START)
+    return ConversationHandler.END
+
+
+# ── Entry point ───────────────────────────────────────────────────────────────
+
+def main() -> None:
+    log.info("Bot starting…")
+
+    app = Application.builder().token(TOKEN).build()
+
+    conv = ConversationHandler(
+        entry_points=[CommandHandler("start", start)],
+        states={
+            AWAITING_TRANSACTION: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, receive_transaction)
+            ],
+            AWAITING_NAME_CITY: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, receive_name_city)
+            ],
+            AWAITING_MOBILE: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, receive_mobile)
+            ],
+        },
+        fallbacks=[
+            CommandHandler("start", start),
+            MessageHandler(filters.ALL, fallback),
+        ],
+        allow_reentry=True,
+    )
+
+    app.add_handler(conv)
+
+    log.info("Polling started (drop_pending_updates=True)")
+    app.run_polling(drop_pending_updates=True)
 
 
 if __name__ == "__main__":
-    run()
+    main()
