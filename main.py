@@ -13,6 +13,7 @@ Full Name & City     → save to Airtable → success message
 from __future__ import annotations
 
 import html
+import io
 import logging
 import os
 import sys
@@ -95,8 +96,19 @@ MSG_SUCCESS = (
 )
 
 # ---------------------------------------------------------------------------
-# File ID cache — populated on first /start, reused for all subsequent calls
+# Receipt photo — pre-loaded into memory at startup (before the event loop).
+# Synchronous file I/O here is safe; inside async handlers it would block
+# the event loop and freeze the bot.
+# _START_PHOTO_FILE_ID is populated on the first send and reused after that.
 # ---------------------------------------------------------------------------
+
+try:
+    with open("receipt_sample.png", "rb") as _f:
+        _RECEIPT_BYTES: bytes | None = _f.read()
+    log.info("receipt_sample.png pre-loaded (%d bytes)", len(_RECEIPT_BYTES))
+except FileNotFoundError:
+    _RECEIPT_BYTES = None
+    log.warning("receipt_sample.png not found — /start will use text fallback")
 
 _START_PHOTO_FILE_ID: str | None = None
 
@@ -105,11 +117,13 @@ _START_PHOTO_FILE_ID: str | None = None
 # ---------------------------------------------------------------------------
 
 async def cmd_start(update: Update, context) -> int:
-    """Entry point: send receipt photo with caption, prompt for Transaction ID.
+    """Entry point: send receipt photo + caption, prompt for Transaction ID.
 
-    First call uploads receipt_sample.png to Telegram and caches the returned
-    file_id.  Every subsequent call passes the file_id string directly —
-    no disk read, no upload, instant response.
+    Execution path (fastest first):
+      1. file_id cached  → send_photo(file_id)          — instant, no I/O
+      2. bytes in memory → send_photo(BytesIO)           — no disk read
+      3. neither         → reply_text(caption)           — safe fallback
+    Any exception is caught so the handler always returns a state.
     """
     global _START_PHOTO_FILE_ID
 
@@ -120,28 +134,32 @@ async def cmd_start(update: Update, context) -> int:
         "እባክዎ የባንክ ደረሰኝ የ Transaction ID ቁጥሩን ፅፈው ይላኩ FT የሚጀምር።"
     )
 
-    if _START_PHOTO_FILE_ID:
-        # Fast path — reuse cached Telegram file_id, no upload
-        await context.bot.send_photo(
-            chat_id=update.effective_chat.id,
-            photo=_START_PHOTO_FILE_ID,
-            caption=caption,
-        )
-    else:
-        # First call — upload from disk and cache the returned file_id
-        try:
-            with open("receipt_sample.png", "rb") as photo_file:
-                sent = await context.bot.send_photo(
-                    chat_id=update.effective_chat.id,
-                    photo=photo_file,
-                    caption=caption,
-                )
-            # Telegram returns the largest available photo size last
+    try:
+        if _START_PHOTO_FILE_ID:
+            # Fastest path — Telegram file_id, no bytes transmitted at all
+            await context.bot.send_photo(
+                chat_id=update.effective_chat.id,
+                photo=_START_PHOTO_FILE_ID,
+                caption=caption,
+            )
+        elif _RECEIPT_BYTES:
+            # First send — upload from in-memory bytes (no disk I/O in event loop)
+            sent = await context.bot.send_photo(
+                chat_id=update.effective_chat.id,
+                photo=io.BytesIO(_RECEIPT_BYTES),
+                caption=caption,
+            )
             _START_PHOTO_FILE_ID = sent.photo[-1].file_id
-            log.info("receipt photo uploaded — file_id cached (%s…)", _START_PHOTO_FILE_ID[:20])
-        except FileNotFoundError:
-            log.warning("receipt_sample.png not found — sending text only")
+            log.info("receipt photo cached — file_id %s…", _START_PHOTO_FILE_ID[:20])
+        else:
+            # No image available — fall back to plain text
             await update.message.reply_text(caption)
+    except Exception as exc:
+        log.error("cmd_start send_photo error: %s — falling back to text", exc)
+        try:
+            await update.message.reply_text(caption)
+        except Exception:
+            pass  # nothing more we can do; state is still returned below
 
     return AWAITING_TRANSACTION
 
