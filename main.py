@@ -194,11 +194,10 @@ async def handle_name_city(update: Update, context) -> int:
         result = airtable_table.update(
             record_id,
             {
-                "Full Name":         text,
-                "User mobile":       phone,
-                "Chat ID":           str(chat_id),
-                "Status":            "Verified",
-                "Telegram Username": username,
+                "Full Name":   text,
+                "User mobile": phone,
+                "Chat ID":     str(chat_id),
+                "Status":      "Verified",
             },
             typecast=True,
         )
