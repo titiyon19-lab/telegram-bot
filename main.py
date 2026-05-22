@@ -95,27 +95,54 @@ MSG_SUCCESS = (
 )
 
 # ---------------------------------------------------------------------------
+# File ID cache — populated on first /start, reused for all subsequent calls
+# ---------------------------------------------------------------------------
+
+_START_PHOTO_FILE_ID: str | None = None
+
+# ---------------------------------------------------------------------------
 # Handlers
 # ---------------------------------------------------------------------------
 
 async def cmd_start(update: Update, context) -> int:
-    """Entry point: send receipt sample photo with caption, prompt for Transaction ID."""
+    """Entry point: send receipt photo with caption, prompt for Transaction ID.
+
+    First call uploads receipt_sample.png to Telegram and caches the returned
+    file_id.  Every subsequent call passes the file_id string directly —
+    no disk read, no upload, instant response.
+    """
+    global _START_PHOTO_FILE_ID
+
     context.user_data.clear()
     first_name = (update.effective_user.first_name or "").strip()
     caption = (
         f"እንኳን ደህና መጡ! 🎉 {first_name}\n\n"
         "እባክዎ የባንክ ደረሰኝ የ Transaction ID ቁጥሩን ፅፈው ይላኩ FT የሚጀምር።"
     )
-    try:
-        with open("receipt_sample.png", "rb") as photo:
-            await context.bot.send_photo(
-                chat_id=update.effective_chat.id,
-                photo=photo,
-                caption=caption,
-            )
-    except FileNotFoundError:
-        log.warning("receipt_sample.png not found — sending text only")
-        await update.message.reply_text(caption)
+
+    if _START_PHOTO_FILE_ID:
+        # Fast path — reuse cached Telegram file_id, no upload
+        await context.bot.send_photo(
+            chat_id=update.effective_chat.id,
+            photo=_START_PHOTO_FILE_ID,
+            caption=caption,
+        )
+    else:
+        # First call — upload from disk and cache the returned file_id
+        try:
+            with open("receipt_sample.png", "rb") as photo_file:
+                sent = await context.bot.send_photo(
+                    chat_id=update.effective_chat.id,
+                    photo=photo_file,
+                    caption=caption,
+                )
+            # Telegram returns the largest available photo size last
+            _START_PHOTO_FILE_ID = sent.photo[-1].file_id
+            log.info("receipt photo uploaded — file_id cached (%s…)", _START_PHOTO_FILE_ID[:20])
+        except FileNotFoundError:
+            log.warning("receipt_sample.png not found — sending text only")
+            await update.message.reply_text(caption)
+
     return AWAITING_TRANSACTION
 
 
