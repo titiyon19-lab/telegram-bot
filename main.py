@@ -99,13 +99,23 @@ MSG_SUCCESS = (
 # ---------------------------------------------------------------------------
 
 async def cmd_start(update: Update, context) -> int:
-    """Entry point: greet with first name, prompt for Transaction ID."""
+    """Entry point: send receipt sample photo with caption, prompt for Transaction ID."""
     context.user_data.clear()
     first_name = (update.effective_user.first_name or "").strip()
-    await update.message.reply_text(
+    caption = (
         f"እንኳን ደህና መጡ! 🎉 {first_name}\n\n"
         "እባክዎ የባንክ ደረሰኝ የ Transaction ID ቁጥሩን ፅፈው ይላኩ FT የሚጀምር።"
     )
+    try:
+        with open("receipt_sample.png", "rb") as photo:
+            await context.bot.send_photo(
+                chat_id=update.effective_chat.id,
+                photo=photo,
+                caption=caption,
+            )
+    except FileNotFoundError:
+        log.warning("receipt_sample.png not found — sending text only")
+        await update.message.reply_text(caption)
     return AWAITING_TRANSACTION
 
 
