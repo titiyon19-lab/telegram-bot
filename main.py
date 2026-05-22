@@ -22,6 +22,7 @@ from telegram import Update
 from telegram.ext import (
     Application,
     CommandHandler,
+    ContextTypes,
     ConversationHandler,
     MessageHandler,
     filters,
@@ -96,19 +97,8 @@ MSG_SUCCESS = (
 )
 
 # ---------------------------------------------------------------------------
-# Receipt photo — pre-loaded into memory at startup (before the event loop).
-# Synchronous file I/O here is safe; inside async handlers it would block
-# the event loop and freeze the bot.
-# _START_PHOTO_FILE_ID is populated on the first send and reused after that.
+# File ID cache — populated on first successful photo send
 # ---------------------------------------------------------------------------
-
-try:
-    with open("receipt_sample.png", "rb") as _f:
-        _RECEIPT_BYTES: bytes | None = _f.read()
-    log.info("receipt_sample.png pre-loaded (%d bytes)", len(_RECEIPT_BYTES))
-except FileNotFoundError:
-    _RECEIPT_BYTES = None
-    log.warning("receipt_sample.png not found — /start will use text fallback")
 
 _START_PHOTO_FILE_ID: str | None = None
 
@@ -116,51 +106,56 @@ _START_PHOTO_FILE_ID: str | None = None
 # Handlers
 # ---------------------------------------------------------------------------
 
-async def cmd_start(update: Update, context) -> int:
-    """Entry point: send receipt photo + caption, prompt for Transaction ID.
+async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Entry point — three-layer fallback so /start NEVER freezes.
 
-    Execution path (fastest first):
-      1. file_id cached  → send_photo(file_id)          — instant, no I/O
-      2. bytes in memory → send_photo(BytesIO)           — no disk read
-      3. neither         → reply_text(caption)           — safe fallback
-    Any exception is caught so the handler always returns a state.
+    Layer 1: cached file_id          → instant, zero bytes over the wire
+    Layer 2: disk upload with timeout → read_timeout/write_timeout=10 s
+    Layer 3: plain text               → always responds even if photo fails
     """
     global _START_PHOTO_FILE_ID
 
     context.user_data.clear()
-    first_name = (update.effective_user.first_name or "").strip()
-    caption = (
-        f"እንኳን ደህና መጡ! 🎉 {first_name}\n\n"
+    caption_text = (
+        f"እንኳን ደህና መጡ! 🎉 {(update.effective_user.first_name or '').strip()}\n\n"
         "እባክዎ የባንክ ደረሰኝ የ Transaction ID ቁጥሩን ፅፈው ይላኩ FT የሚጀምር።"
     )
 
-    try:
-        if _START_PHOTO_FILE_ID:
-            # Fastest path — Telegram file_id, no bytes transmitted at all
+    # Layer 1 — cached file_id (instant)
+    if _START_PHOTO_FILE_ID:
+        try:
             await context.bot.send_photo(
                 chat_id=update.effective_chat.id,
                 photo=_START_PHOTO_FILE_ID,
-                caption=caption,
+                caption=caption_text,
             )
-        elif _RECEIPT_BYTES:
-            # First send — upload from in-memory bytes (no disk I/O in event loop)
-            sent = await context.bot.send_photo(
-                chat_id=update.effective_chat.id,
-                photo=io.BytesIO(_RECEIPT_BYTES),
-                caption=caption,
-            )
-            _START_PHOTO_FILE_ID = sent.photo[-1].file_id
-            log.info("receipt photo cached — file_id %s…", _START_PHOTO_FILE_ID[:20])
-        else:
-            # No image available — fall back to plain text
-            await update.message.reply_text(caption)
-    except Exception as exc:
-        log.error("cmd_start send_photo error: %s — falling back to text", exc)
-        try:
-            await update.message.reply_text(caption)
-        except Exception:
-            pass  # nothing more we can do; state is still returned below
+            return AWAITING_TRANSACTION
+        except Exception as exc:
+            log.warning("cached file_id failed (%s) — falling back to upload", exc)
+            _START_PHOTO_FILE_ID = None   # clear stale cache
 
+    # Layer 2 — direct disk upload with explicit timeouts
+    try:
+        with open("receipt_sample.png", "rb") as photo_file:
+            message = await context.bot.send_photo(
+                chat_id=update.effective_chat.id,
+                photo=photo_file,
+                caption=caption_text,
+                read_timeout=10,
+                write_timeout=10,
+            )
+        if message.photo:
+            _START_PHOTO_FILE_ID = message.photo[-1].file_id
+            log.info("receipt photo cached — file_id %s…", _START_PHOTO_FILE_ID[:20])
+        return AWAITING_TRANSACTION
+    except Exception as exc:
+        log.error("photo upload failed (%s) — sending text fallback", exc)
+
+    # Layer 3 — ultimate fallback: plain text, never freezes
+    await context.bot.send_message(
+        chat_id=update.effective_chat.id,
+        text=caption_text,
+    )
     return AWAITING_TRANSACTION
 
 
