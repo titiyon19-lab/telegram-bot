@@ -97,8 +97,16 @@ MSG_SUCCESS = (
 )
 
 # ---------------------------------------------------------------------------
-# File ID cache — populated on first successful photo send
+# Receipt bytes — pre-loaded at module startup (safe: runs before event loop)
 # ---------------------------------------------------------------------------
+
+try:
+    with open("receipt_sample.png", "rb") as _f:
+        _RECEIPT_BYTES: bytes | None = _f.read()
+    log.info("receipt_sample.png pre-loaded (%d bytes)", len(_RECEIPT_BYTES))
+except FileNotFoundError:
+    _RECEIPT_BYTES = None
+    log.warning("receipt_sample.png not found — Layer 2 will be skipped")
 
 _START_PHOTO_FILE_ID: str | None = None
 
@@ -107,21 +115,15 @@ _START_PHOTO_FILE_ID: str | None = None
 # ---------------------------------------------------------------------------
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Entry point — three-layer fallback so /start NEVER freezes.
-
-    Layer 1: cached file_id          → instant, zero bytes over the wire
-    Layer 2: disk upload with timeout → read_timeout/write_timeout=10 s
-    Layer 3: plain text               → always responds even if photo fails
-    """
     global _START_PHOTO_FILE_ID
-
-    context.user_data.clear()
     caption_text = (
         f"እንኳን ደህና መጡ! 🎉 {(update.effective_user.first_name or '').strip()}\n\n"
         "እባክዎ የባንክ ደረሰኝ የ Transaction ID ቁጥሩን ፅፈው ይላኩ FT የሚጀምር።"
     )
 
-    # Layer 1 — cached file_id (instant)
+    context.user_data.clear()
+
+    # Layer 1: Try sending with cached File ID
     if _START_PHOTO_FILE_ID:
         try:
             await context.bot.send_photo(
@@ -130,32 +132,34 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
                 caption=caption_text,
             )
             return AWAITING_TRANSACTION
-        except Exception as exc:
-            log.warning("cached file_id failed (%s) — falling back to upload", exc)
-            _START_PHOTO_FILE_ID = None   # clear stale cache
+        except Exception:
+            _START_PHOTO_FILE_ID = None  # Clear invalid cache and fall through
 
-    # Layer 2 — direct disk upload with explicit timeouts
-    try:
-        with open("receipt_sample.png", "rb") as photo_file:
+    # Layer 2: Try sending using pre-loaded BytesIO memory
+    if "_RECEIPT_BYTES" in globals() and _RECEIPT_BYTES:
+        try:
             message = await context.bot.send_photo(
                 chat_id=update.effective_chat.id,
-                photo=photo_file,
+                photo=io.BytesIO(_RECEIPT_BYTES),
                 caption=caption_text,
-                read_timeout=10,
-                write_timeout=10,
+                read_timeout=5,
+                write_timeout=5,
             )
-        if message.photo:
-            _START_PHOTO_FILE_ID = message.photo[-1].file_id
-            log.info("receipt photo cached — file_id %s…", _START_PHOTO_FILE_ID[:20])
-        return AWAITING_TRANSACTION
-    except Exception as exc:
-        log.error("photo upload failed (%s) — sending text fallback", exc)
+            if message.photo:
+                _START_PHOTO_FILE_ID = message.photo[-1].file_id
+            return AWAITING_TRANSACTION
+        except Exception:
+            pass  # Fall through to text-only if memory send fails
 
-    # Layer 3 — ultimate fallback: plain text, never freezes
-    await context.bot.send_message(
-        chat_id=update.effective_chat.id,
-        text=caption_text,
-    )
+    # Layer 3: Ultimate Text Fallback (Guaranteed to always reply)
+    try:
+        await context.bot.send_message(
+            chat_id=update.effective_chat.id,
+            text=caption_text,
+        )
+    except Exception:
+        pass
+
     return AWAITING_TRANSACTION
 
 
